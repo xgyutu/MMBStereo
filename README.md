@@ -1,5 +1,5 @@
   <p align="center">
-  <h1 align="center">TAMamba-Stereo: A Multi-Branch Fast Stereo Matching Network Based on the Mamba Architecture</h1>
+  <h1 align="center">Mamba-Based Multi-Branch Cost Aggregation for Stereo Matching</h1>
   <p align="center">
 
 "### The paper was submitted on June 10, 2024.
