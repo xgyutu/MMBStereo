@@ -1,16 +1,10 @@
-# from __future__ import print_function, division
 import argparse
 import os
 import torch
 import torch.nn as nn
-import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
-import torch.utils.data
 from tqdm import tqdm
-from torch.autograd import Variable
-import torchvision.utils as vutils
-import torch.nn.functional as F
 import numpy as np
 import time
 from tensorboardX import SummaryWriter
@@ -19,19 +13,17 @@ from models import __models__, model_loss_train, model_loss_test
 from utils import *
 from torch.utils.data import DataLoader
 import gc
-import cv2
 
 cudnn.benchmark = True
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
-parser = argparse.ArgumentParser(
-    description='TAM-Stereo')
-parser.add_argument('--model', default='TAM_Stereo', help='select a model structure', choices=__models__.keys())
+parser = argparse.ArgumentParser(description='MMB-Stereo: Mamba-based Multi-branch Cost Aggregation')
+parser.add_argument('--model', default='MMBStereo', help='select a model structure', choices=__models__.keys())
 parser.add_argument('--maxdisp', type=int, default=192, help='maximum disparity')
 
 parser.add_argument('--dataset', default='kitti', help='dataset name', choices=__datasets__.keys())
-parser.add_argument('--kitti12_datapath', default='/root/autodl-tmp/KITTI/KITTI_2012/', help='data path')
-parser.add_argument('--kitti15_datapath', default='/root/autodl-tmp/KITTI/KITTI_2015/', help='data path')
+parser.add_argument('--kitti12_datapath', default='/root/autodl-tmp/KITTI/KITTI_2012/', help='KITTI 2012 data path')
+parser.add_argument('--kitti15_datapath', default='/root/autodl-tmp/KITTI/KITTI_2015/', help='KITTI 2015 data path')
 parser.add_argument('--trainlist', default='./filenames/kitti12_15_test.txt', help='training list')
 parser.add_argument('--testlist', default='./filenames/kitti15_val.txt', help='testing list')
 
@@ -39,58 +31,48 @@ parser.add_argument('--lr', type=float, default=0.001, help='base learning rate'
 parser.add_argument('--batch_size', type=int, default=8, help='training batch size')
 parser.add_argument('--test_batch_size', type=int, default=8, help='testing batch size')
 parser.add_argument('--epochs', type=int, default=500, help='number of epochs to train')
-parser.add_argument('--lrepochs', default="300:10", type=str, help='the epochs to decay lr: the downscale rate')
-parser.add_argument('--logdir', default='./runs/kitti/TAM-Stereo/', help='the directory to save logs and checkpoints')
-parser.add_argument('--loadckpt', default='', help='load the weights from a specific checkpoint')
-parser.add_argument('--resume', action='store_true', help='continue training the model')
-parser.add_argument('--seed', type=int, default=666, metavar='S', help='random seed (default: 1)')
-parser.add_argument('--summary_freq', type=int, default=20, help='the frequency of saving summary')
-parser.add_argument('--save_freq', type=int, default=100, help='the frequency of saving checkpoint')
+parser.add_argument('--lrepochs', default="300:10", type=str, help='learning rate decay epochs and rate')
+parser.add_argument('--logdir', default='./runs/kitti/MMB-Stereo/', help='directory to save logs and checkpoints')
+parser.add_argument('--loadckpt', default='', help='load weights from specific checkpoint')
+parser.add_argument('--resume', action='store_true', help='continue training from latest checkpoint')
+parser.add_argument('--seed', type=int, default=666, help='random seed')
+parser.add_argument('--summary_freq', type=int, default=20, help='frequency of saving summary')
+parser.add_argument('--save_freq', type=int, default=100, help='frequency of saving checkpoint')
 
-# parse arguments, set seeds
 args = parser.parse_args()
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed(args.seed)
 os.makedirs(args.logdir, exist_ok=True)
 
-# create summary logger
-# print("creating new summary file")
 logger = SummaryWriter(args.logdir)
 
-# dataset, dataloader
 StereoDataset = __datasets__[args.dataset]
 train_dataset = StereoDataset(args.kitti15_datapath, args.kitti12_datapath, args.trainlist, True)
 test_dataset = StereoDataset(args.kitti15_datapath, args.kitti12_datapath, args.testlist, False)
 TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True, num_workers=8, drop_last=True)
-TestImgLoader = DataLoader(test_dataset, args.test_batch_size, shuffle=False, num_workers=8 , drop_last=False)
+TestImgLoader = DataLoader(test_dataset, args.test_batch_size, shuffle=False, num_workers=8, drop_last=False)
 
-# model, optimizer
 model = __models__[args.model](args.maxdisp)
 model = nn.DataParallel(model)
 model.cuda()
 optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
 
-# load parameters
 start_epoch = 0
 if args.resume:
-    # find all checkpoints file and sort according to epoch id
     all_saved_ckpts = [fn for fn in os.listdir(args.logdir) if fn.endswith(".ckpt")]
     all_saved_ckpts = sorted(all_saved_ckpts, key=lambda x: int(x.split('_')[-1].split('.')[0]))
-    # use the latest checkpoint file
     loadckpt = os.path.join(args.logdir, all_saved_ckpts[-1])
-    print("loading the lastest model in logdir: {}".format(loadckpt))
+    print("loading the latest model in logdir: {}".format(loadckpt))
     state_dict = torch.load(loadckpt)
     model.load_state_dict(state_dict['model'])
     optimizer.load_state_dict(state_dict['optimizer'])
     start_epoch = state_dict['epoch'] + 1
 elif args.loadckpt:
-    # load the checkpoint file specified by args.loadckpt
     print("loading model {}".format(args.loadckpt))
     state_dict = torch.load(args.loadckpt)
     model_dict = model.state_dict()
     pre_dict = {k: v for k, v in state_dict['model'].items() if k in model_dict}
     model_dict.update(pre_dict) 
-    # model.load_state_dict(state_dict['model'])
     model.load_state_dict(model_dict)
 print("start at epoch {}".format(start_epoch))
 
@@ -101,7 +83,6 @@ def train():
     for epoch_idx in range(start_epoch, args.epochs):
         adjust_learning_rate(optimizer, epoch_idx, args.lr, args.lrepochs)
 
-        # training
         for batch_idx, sample in enumerate(tqdm(TrainImgLoader)):
             global_step = len(TrainImgLoader) * epoch_idx + batch_idx
             start_time = time.time()
@@ -116,18 +97,12 @@ def train():
                                                                                        len(TrainImgLoader), loss,
                                                                                        time.time() - start_time))
 
-        # saving checkpoints
-
         if (epoch_idx + 1) % args.save_freq == 0:
             checkpoint_data = {'epoch': epoch_idx, 'model': model.state_dict(), 'optimizer': optimizer.state_dict()}
-            # id_epoch = (epoch_idx + 1) % 100
             torch.save(checkpoint_data, "{}/checkpoint_{:0>6}.ckpt".format(args.logdir, epoch_idx))
         gc.collect()
 
-        # testing
         avg_test_scalars = AverageMeterDict()
-        #bestepoch = 0
-        #error = 100
         for batch_idx, sample in enumerate(tqdm(TestImgLoader)):
             global_step = len(TestImgLoader) * epoch_idx + batch_idx
             start_time = time.time()
@@ -169,11 +144,6 @@ def train_sample(sample, compute_metrics=False):
     masks = [mask, mask_low, mask, mask]
     disp_gts = [disp_gt, disp_gt_low, disp_gt, disp_gt] 
     
-    # print("disp_ests", disp_ests[2].shape)
-    # print("disp_gts", disp_gts[2].shape)
-    # print("masks", masks[2].shape)
-    
-    
     loss = model_loss_train(disp_ests, disp_gts, masks)
     scalar_outputs = {"loss": loss}
     image_outputs = {"disp_est": disp_ests, "disp_gt": disp_gt, "imgL": imgL, "imgR": imgR}
@@ -182,9 +152,6 @@ def train_sample(sample, compute_metrics=False):
             image_outputs["errormap"] = [disp_error_image_func.apply(disp_ests[0], disp_gt)]
             scalar_outputs["EPE"] = [EPE_metric(disp_ests[0], disp_gt, mask)]
             scalar_outputs["D1"] = [D1_metric(disp_ests[0], disp_gt, mask)]
-            # scalar_outputs["Thres1"] = [Thres_metric(disp_ests[0], disp_gt, mask, 1.0)]
-            # scalar_outputs["Thres2"] = [Thres_metric(disp_ests[0], disp_gt, mask, 2.0)]
-            # scalar_outputs["Thres3"] = [Thres_metric(disp_ests[0], disp_gt, mask, 3.0)]
     loss.backward()
     optimizer.step()
 
